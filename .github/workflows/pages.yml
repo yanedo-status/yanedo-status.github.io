@@ -1,0 +1,61 @@
+# Chaîne de l'hébergeur (GitHub Pages, source « GitHub Actions »). Posée par « statusgen.py publish-git » dans
+# .github/workflows/ du dépôt public. Elle construit la page à chaque poussée sur main, que la poussée vienne de
+# yanedo/status (chaîne publish) ou d'une mise à jour faite à la main dans le navigateur quand le cluster est arrêté.
+#
+# Pourquoi pas une branche gh-pages : GitHub ne reconstruit pas une page publiée « depuis une branche » quand la
+# poussée vient du GITHUB_TOKEN d'une chaîne (docs GitHub Pages, « Troubleshooting publishing from a branch »). La
+# page ne se serait plus mise à jour après la première publication. On publie donc par les deux actions de GitHub
+# lui-même, épinglées par empreinte (versions de plus de 14 jours) ; aucune action d'un tiers.
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Source
+        run: |
+          git init -q src
+          cd src
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
+
+      - name: Construire (refuse tout contenu invalide ou non public)
+        working-directory: src
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet --require-hashes --no-deps -r requirements.txt
+          .venv/bin/python statusgen.py build --out ../site --require-real-base-url
+
+      - name: Paquet de la page
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0 (08/04/2026)
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publier la page
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1 (01/09/2026)

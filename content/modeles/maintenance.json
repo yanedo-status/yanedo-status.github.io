@@ -1,0 +1,18 @@
+{
+  "schema": "yanedo-status-event/1",
+  "id": "2026-11-26-maintenance-documents",
+  "kind": "maintenance",
+  "status": "scheduled",
+  "at": "2026-11-20T17:30:00+01:00",
+  "start": "2026-11-26T19:00:00+01:00",
+  "end": "2026-11-26T20:00:00+01:00",
+  "modules": [
+    "dms"
+  ],
+  "impact": "unavailable",
+  "text": {
+    "fr": "Le module sera indisponible environ 10 minutes.",
+    "de": "Das Modul ist etwa 10 Minuten nicht verfügbar.",
+    "en": "The module will be unavailable for about 10 minutes."
+  }
+}

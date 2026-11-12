@@ -1,0 +1,26 @@
+{
+  "schema": "yanedo-status-event/1",
+  "id": "2026-11-24-incident-documents",
+  "kind": "incident",
+  "status": "resolved",
+  "at": "2026-11-24T10:40:00+01:00",
+  "modules": [
+    "dms"
+  ],
+  "severity": "partial",
+  "effect": {
+    "fr": "l'import de documents est lent ou échoue. La consultation fonctionne.",
+    "de": "Der Import von Dokumenten ist langsam oder schlägt fehl. Die Anzeige funktioniert.",
+    "en": "Importing documents is slow or fails. Viewing works."
+  },
+  "text": {
+    "fr": "Le service fonctionne de nouveau normalement.",
+    "de": "Der Dienst funktioniert wieder normal.",
+    "en": "The service is working normally again."
+  },
+  "summary": {
+    "fr": "Ce qui s'est passé. Ce que nous avons fait. Ce qui change.",
+    "de": "Was geschah. Was wir getan haben. Was sich ändert.",
+    "en": "What happened. What we did. What changes."
+  }
+}

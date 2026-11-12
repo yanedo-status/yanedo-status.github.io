@@ -1,0 +1,39 @@
+# Les services affichés : un par module, comme les clients les connaissent. Jamais un composant technique.
+# Les clés sont celles des modules du shell (liste unique, partagée avec les chaînes de releases et l'Accueil du shell) ;
+# la correspondance composant → module vit dans le dépôt releases, jamais ici. Les noms reprennent ceux du shell.
+# « all » (tous les services) est réservé : il ne figure pas dans cette liste.
+services:
+  - key: comptabilite
+    name: {fr: "Comptabilité", de: "Buchhaltung", en: "Accounting"}
+  - key: salaires
+    name: {fr: "Salaires", de: "Gehaltsabrechnung", en: "Payroll"}
+  - key: rh
+    name: {fr: "Ressources humaines", de: "Personalwesen", en: "Human resources"}
+  - key: banque
+    name: {fr: "Banque", de: "Bank", en: "Banking"}
+  - key: ventes
+    name: {fr: "Ventes", de: "Verkauf", en: "Sales"}
+  - key: achats
+    name: {fr: "Achats", de: "Einkauf", en: "Purchasing"}
+  - key: stocks
+    name: {fr: "Stocks", de: "Lager", en: "Inventory"}
+  - key: crm
+    name: {fr: "CRM", de: "CRM", en: "CRM"}
+  - key: dms
+    name: {fr: "Documents", de: "Documents", en: "Documents"}
+  - key: collaboration
+    name: {fr: "Collaboration", de: "Zusammenarbeit", en: "Collaboration"}
+  - key: mail
+    name: {fr: "Messagerie", de: "E-Mail", en: "Mail"}
+  - key: ticketing
+    name: {fr: "Ticketing", de: "Ticketing", en: "Ticketing"}
+  - key: dns
+    name: {fr: "DNS", de: "DNS", en: "DNS"}
+  - key: apps
+    name: {fr: "Web", de: "Web", en: "Web"}
+  - key: llm
+    name: {fr: "Assistant IA", de: "KI-Assistent", en: "AI Assistant"}
+
+# Modules internes : acceptés dans un événement (liste unique des clés), jamais affichés. Un événement qui ne touche
+# qu'eux n'apparaît pas sur la page publique. « documents » est l'ancien Drive, retiré. Garder cette liste sur une ligne.
+internal_keys: [admin, showcase, argus, claude-obs, documents]

@@ -1,0 +1,22 @@
+{
+  "schema": "yanedo-status-event/1",
+  "id": "2026-11-24-incident-documents",
+  "kind": "incident",
+  "status": "reported",
+  "at": "2026-11-24T09:58:00+01:00",
+  "modules": [
+    "dms"
+  ],
+  "severity": "partial",
+  "effect": {
+    "fr": "l'import de documents est lent ou échoue. La consultation fonctionne.",
+    "de": "Der Import von Dokumenten ist langsam oder schlägt fehl. Die Anzeige funktioniert.",
+    "en": "Importing documents is slow or fails. Viewing works."
+  },
+  "text": {
+    "fr": "Le problème nous est signalé. Nous enquêtons.",
+    "de": "Das Problem wurde uns gemeldet. Wir untersuchen es.",
+    "en": "The problem has been reported to us. We are investigating."
+  },
+  "next_update_by": "2026-11-24T10:30:00+01:00"
+}

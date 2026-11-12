@@ -1,0 +1,7 @@
+# Câblage du site : ce n'est pas un réglage métier.
+# base_url : le nom donné par l'hébergeur, posé au G9. Tant que c'est un exemple en .invalid, la publication refuse.
+base_url: "https://yanedo-status.github.io/"
+# Heure de la dernière modification des textes fixes. Elle sert de « dernière mise à jour » tant qu'aucun événement n'existe.
+updated_at: "2026-11-12T14:00:00+01:00"
+# Profondeur de l'historique affiché (note T32 v2.0, § 7 : les 30 derniers jours).
+history_days: 30
