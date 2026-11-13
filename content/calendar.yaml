@@ -1,0 +1,114 @@
+# Jours non ouvrables, pour les barres de disponibilité : ces jours sont hors des heures du contrat.
+# Les données ci-dessous (à partir de « schema: ») sont une COPIE de calendar.yaml du dépôt releases, au commit
+# bc86f23 (13/11/2026). Les commentaires de releases ne sont pas recopiés : ce fichier est public.
+# Report : à chaque changement de releases/calendar.yaml (au plus tard pour 2028, avant le 31/12/2027).
+# Seuls timezone, contract_hours et holidays sont lus ; build vérifie que les heures restent 09:00-17:00.
+schema: 1
+timezone: "Europe/Zurich"
+canton: "VD"
+business_days:
+  - "mon"
+  - "tue"
+  - "wed"
+  - "thu"
+  - "fri"
+business_hours:
+  start: "07:00"
+  end: "18:00"
+contract_hours:
+  start: "09:00"
+  end: "17:00"
+covered_years:
+  - 2026
+  - 2027
+holidays:
+  - date: "2026-01-01"
+    name:
+      fr: "Nouvel An"
+      de: "Neujahr"
+      en: "New Year's Day"
+  - date: "2026-01-02"
+    name:
+      fr: "Lendemain de Nouvel An"
+      de: "Berchtoldstag"
+      en: "Berchtold's Day"
+  - date: "2026-04-03"
+    name:
+      fr: "Vendredi saint"
+      de: "Karfreitag"
+      en: "Good Friday"
+  - date: "2026-04-06"
+    name:
+      fr: "Lundi de Pâques"
+      de: "Ostermontag"
+      en: "Easter Monday"
+  - date: "2026-05-14"
+    name:
+      fr: "Ascension"
+      de: "Auffahrt"
+      en: "Ascension Day"
+  - date: "2026-05-25"
+    name:
+      fr: "Lundi de Pentecôte"
+      de: "Pfingstmontag"
+      en: "Whit Monday"
+  - date: "2026-08-01"
+    name:
+      fr: "Fête nationale"
+      de: "Bundesfeier"
+      en: "Swiss National Day"
+  - date: "2026-09-21"
+    name:
+      fr: "Lundi du Jeûne fédéral"
+      de: "Bettagsmontag"
+      en: "Federal Fast Monday"
+  - date: "2026-12-25"
+    name:
+      fr: "Noël"
+      de: "Weihnachten"
+      en: "Christmas Day"
+  - date: "2027-01-01"
+    name:
+      fr: "Nouvel An"
+      de: "Neujahr"
+      en: "New Year's Day"
+  - date: "2027-01-02"
+    name:
+      fr: "Lendemain de Nouvel An"
+      de: "Berchtoldstag"
+      en: "Berchtold's Day"
+  - date: "2027-03-26"
+    name:
+      fr: "Vendredi saint"
+      de: "Karfreitag"
+      en: "Good Friday"
+  - date: "2027-03-29"
+    name:
+      fr: "Lundi de Pâques"
+      de: "Ostermontag"
+      en: "Easter Monday"
+  - date: "2027-05-06"
+    name:
+      fr: "Ascension"
+      de: "Auffahrt"
+      en: "Ascension Day"
+  - date: "2027-05-17"
+    name:
+      fr: "Lundi de Pentecôte"
+      de: "Pfingstmontag"
+      en: "Whit Monday"
+  - date: "2027-08-01"
+    name:
+      fr: "Fête nationale"
+      de: "Bundesfeier"
+      en: "Swiss National Day"
+  - date: "2027-09-20"
+    name:
+      fr: "Lundi du Jeûne fédéral"
+      de: "Bettagsmontag"
+      en: "Federal Fast Monday"
+  - date: "2027-12-25"
+    name:
+      fr: "Noël"
+      de: "Weihnachten"
+      en: "Christmas Day"

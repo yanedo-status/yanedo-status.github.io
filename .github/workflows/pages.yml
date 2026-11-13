@@ -6,11 +6,18 @@
 # poussée vient du GITHUB_TOKEN d'une chaîne (docs GitHub Pages, « Troubleshooting publishing from a branch »). La
 # page ne se serait plus mise à jour après la première publication. On publie donc par les deux actions de GitHub
 # lui-même, épinglées par empreinte (versions de plus de 14 jours) ; aucune action d'un tiers.
+#
+# Barres de disponibilité : la page lit les mesures de la sonde (branche probe-data, écrite par probe.yml). Elle est
+# reconstruite toutes les 30 minutes pendant les heures du contrat, et une fois la nuit pour passer au jour suivant ;
+# jamais à la minute 0. Sans branche probe-data, la page se construit sans barres.
 name: pages
 
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: "11,41 6-16 * * 1-5"
+    - cron: "17 1 * * *"
   workflow_dispatch:
 
 permissions:
@@ -33,12 +40,24 @@ jobs:
           git fetch -q --depth 1 origin "${GITHUB_SHA}"
           git checkout -q FETCH_HEAD
 
+      - name: Mesures de la sonde (branche probe-data, lecture seule)
+        run: |
+          git init -q probe-data
+          cd probe-data
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads origin probe-data > /dev/null; then
+            git fetch -q --depth 1 origin probe-data
+            git checkout -q FETCH_HEAD
+          else
+            echo "pas encore de mesures : page sans barres de disponibilité"
+          fi
+
       - name: Construire (refuse tout contenu invalide ou non public)
         working-directory: src
         run: |
           python3 -m venv .venv
           .venv/bin/pip install --quiet --require-hashes --no-deps -r requirements.txt
-          .venv/bin/python statusgen.py build --out ../site --require-real-base-url
+          .venv/bin/python statusgen.py build --out ../site --require-real-base-url --probe-data ../probe-data/probe
 
       - name: Paquet de la page
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0 (08/04/2026)
