@@ -502,6 +502,11 @@ LEVELS = ("full", "brief", "degraded", "down")  # du meilleur au pire
 LEVEL_FLOOR = {"partial": "brief", "major": "degraded"}  # un jour avec un incident déclaré n'est jamais vert
 # Contrat d'abonnement, définition de la « Maintenance Planifiée » : annoncée au moins 5 Jours Ouvrables à l'avance.
 MAINTENANCE_NOTICE_DAYS = 5
+# Compteurs publiés pour le rapport mensuel de chaque client (availability.json) : le calcul par module ci-dessous,
+# à l'identique. Toute modification de la règle change CALC_VERSION et les vecteurs de conformité (conformite/).
+AVAILABILITY_SCHEMA = "yanedo-status-availability/1"
+CALC_VERSION = "statusgen-availability/1"
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def month_list(today: dt.date, back: int) -> list[tuple[int, int]]:
@@ -682,6 +687,30 @@ class Availability:
         start, end = max(announced[0], e.time("start")), min(announced[1], e.time("end"))
         return (start, end) if start < end else None
 
+    def slot_letters(self, key: str, day: dt.date) -> str:
+        """Les 96 créneaux d'un Jour Ouvrable, une lettre chacun (créneau i = 09:00 + 5 min × i, heure de Zurich) :
+        U mesuré disponible, D mesuré indisponible, M Maintenance Planifiée (hors du calcul), - attendu mais non
+        mesuré, . non attendu (avant la première mesure du service, ou pas encore écoulé). Jour non ouvrable : "".
+        C'est la règle de la page ; _day n'en fait que le compte, et le rapport mensuel la rejoue (vecteurs)."""
+        if not self.working_day(day):
+            return ""
+        ws = dt.datetime.combine(day, CONTRACT_START, ZURICH)
+        first = self.data.first.get(key)
+        slots = self.data.slots.get(key, {})
+        letters = []
+        for i in range(SLOTS_PER_DAY):
+            s = ws + i * SLOT
+            e = s + SLOT
+            if any(_overlaps(s, e, a, b) for a, b in self.maintenance[key]):
+                letters.append("M")
+                continue
+            value = slots.get(s.astimezone(UTC))
+            if value is None:
+                letters.append("." if first is None or e <= first or e > self.now else "-")
+            else:
+                letters.append("U" if value else "D")
+        return "".join(letters)
+
     def _day(self, key: str, day: dt.date) -> DayStat:
         day_start = dt.datetime.combine(day, dt.time(0), ZURICH)
         day_end = dt.datetime.combine(day + dt.timedelta(days=1), dt.time(0), ZURICH)
@@ -694,23 +723,10 @@ class Availability:
         ws = dt.datetime.combine(day, CONTRACT_START, ZURICH)
         we = dt.datetime.combine(day, CONTRACT_END, ZURICH)
         first = self.data.first.get(key)
-        slots = self.data.slots.get(key, {})
-        up = measured = expected = excluded = 0
-        for i in range(SLOTS_PER_DAY):
-            s = ws + i * SLOT
-            e = s + SLOT
-            if any(_overlaps(s, e, a, b) for a, b in self.maintenance[key]):
-                excluded += 1
-                continue
-            value = slots.get(s.astimezone(UTC))
-            if value is None:
-                if first is None or e <= first or e > self.now:
-                    continue  # avant la première mesure de ce service, ou créneau pas encore écoulé
-                expected += 1
-            else:
-                expected += 1
-                measured += 1
-                up += value
+        letters = self.slot_letters(key, day)
+        up, excluded = letters.count("U"), letters.count("M")
+        measured = up + letters.count("D")
+        expected = measured + letters.count("-")  # « . » : avant la première mesure, ou pas encore écoulé
         if expected == 0:
             if excluded == SLOTS_PER_DAY:
                 reason = "maintenance"
@@ -771,6 +787,33 @@ def calendar_warnings(root: Path, now: dt.datetime) -> list[str]:
     year = _local(now).year
     return [] if year in covered else [f"calendar.yaml : l'année {year} n'est pas couverte (covered_years) : "
                                        "reporter le calendar.yaml de releases"]
+
+
+def utc_z(d: dt.datetime) -> str:
+    return d.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def availability_document(c: Content, a: Availability, now: dt.datetime, sources: dict[str, str | None],
+                          events_files: list[str]) -> dict:
+    """availability.json : par module et par mois, les compteurs du tableau public (D7), plus de quoi relire les
+    mêmes entrées par commit (SHA de main et de probe-data, fichiers d'événements lus). Le rapport mensuel de chaque
+    client (admin-api) refuse de publier si son propre calcul par module diffère de ces compteurs au même SHA."""
+    return {
+        "schema": AVAILABILITY_SCHEMA,
+        "calc_version": CALC_VERSION,
+        "generated_at": utc_z(now),
+        "sources": {"main": sources.get("main"), "probe_data": sources.get("probe_data")},
+        "contract": {"timezone": "Europe/Zurich", "start": CONTRACT_START.strftime("%H:%M"),
+                     "end": CONTRACT_END.strftime("%H:%M"), "slot_minutes": SLOT.seconds // 60,
+                     "maintenance_notice_working_days": MAINTENANCE_NOTICE_DAYS},
+        "events_files": events_files,
+        "first_measure": {k: utc_z(v) for k, v in sorted(a.data.first.items())},
+        "last_measure": utc_z(a.last) if a.last else None,
+        "services": {svc["key"]: {"months": {f"{y:04d}-{m:02d}": dict(zip(("up", "measured", "expected"),
+                                                                            a.monthly[svc["key"]][(y, m)]))
+                                             for y, m in a.months}}
+                     for svc in c.services},
+    }
 
 
 def floor_percent(value: float, decimals: int) -> float:
@@ -1261,7 +1304,13 @@ def render_ics(c: Content, lang: str, entries: list[Entry], name: str) -> str:
 # --------------------------------------------------------------------------------------------- construction
 
 def build(root: Path, out: Path, now: dt.datetime, base_url: str | None = None, extra: list[Path] = (),
-          require_real_base_url: bool = False, probe_data: Path | None = None) -> State:
+          require_real_base_url: bool = False, probe_data: Path | None = None, source_sha: str | None = None,
+          probe_sha: str | None = None) -> State:
+    bad = [f"{name} doit être un SHA de commit complet (40 caractères hexadécimaux), reçu {value!r}"
+           for name, value in (("--source-sha", source_sha), ("--probe-sha", probe_sha))
+           if value is not None and not SHA_RE.match(value)]
+    if bad:
+        raise ContentError(bad)
     content = Content(root, base_url)
     if require_real_base_url and content.host.endswith(".invalid"):
         raise ContentError([f"base_url {content.base_url!r} est un exemple : le nom de l'hébergeur doit être posé (G9)"])
@@ -1282,6 +1331,13 @@ def build(root: Path, out: Path, now: dt.datetime, base_url: str | None = None, 
     shutil.copyfile(root / "assets" / "style.css", out / "style.css")
     (out / ".nojekyll").write_text("", encoding="utf-8")
     files: dict[Path, str] = {}
+    if state.availability is not None:
+        events_dir = root / "content" / "events"
+        events_files = sorted(p.relative_to(root).as_posix() for pattern in ("*.json", "*.yaml")
+                              for p in events_dir.glob(pattern))
+        doc = availability_document(content, state.availability, now, {"main": source_sha, "probe_data": probe_sha},
+                                    events_files)
+        files[out / "availability.json"] = json.dumps(doc, ensure_ascii=False, indent=1) + "\n"
     for lang in LANGS:
         base = out if lang == "fr" else out / lang
         files[base / "index.html"] = render_html(content, state, lang)
@@ -1406,6 +1462,8 @@ def main(argv: list[str] | None = None) -> int:
     p_build.add_argument("--event", action="append", default=[], help="événement en plus (essai à blanc)")
     p_build.add_argument("--require-real-base-url", action="store_true")
     p_build.add_argument("--probe-data", help="dossier des mesures de la sonde (*.jsonl), branche probe-data")
+    p_build.add_argument("--source-sha", help="SHA du commit de main construit (écrit dans availability.json)")
+    p_build.add_argument("--probe-sha", help="SHA du commit de probe-data lu (écrit dans availability.json)")
     p_check = sub.add_parser("check-event", help="vérifier des fichiers d'événement")
     p_check.add_argument("files", nargs="+")
     p_check.add_argument("--now")
@@ -1423,7 +1481,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "build":
             now = _now(args.now)
             state = build(ROOT, Path(args.out), now, args.base_url, [Path(p) for p in args.event],
-                          args.require_real_base_url, Path(args.probe_data) if args.probe_data else None)
+                          args.require_real_base_url, Path(args.probe_data) if args.probe_data else None,
+                          args.source_sha, args.probe_sha)
             print(f"page construite dans {args.out} : bandeau « {state.banner} », {len(state.incidents)} incident(s), "
                   f"{len(state.maintenances)} maintenance(s), {len(state.history)} événement(s) dans l'historique")
             a = state.availability

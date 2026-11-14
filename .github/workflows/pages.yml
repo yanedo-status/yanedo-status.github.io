@@ -57,7 +57,11 @@ jobs:
         run: |
           python3 -m venv .venv
           .venv/bin/pip install --quiet --require-hashes --no-deps -r requirements.txt
-          .venv/bin/python statusgen.py build --out ../site --require-real-base-url --probe-data ../probe-data/probe
+          # SHA des deux commits lus, écrits dans availability.json : le rapport mensuel relit les mêmes entrées par
+          # commit (raw.githubusercontent.com/<dépôt>/<sha>/…), jamais par branche.
+          PROBE_SHA="$(git -C ../probe-data rev-parse -q --verify HEAD || true)"
+          .venv/bin/python statusgen.py build --out ../site --require-real-base-url --probe-data ../probe-data/probe \
+            --source-sha "${GITHUB_SHA}" ${PROBE_SHA:+--probe-sha "$PROBE_SHA"}
 
       - name: Paquet de la page
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0 (08/04/2026)
