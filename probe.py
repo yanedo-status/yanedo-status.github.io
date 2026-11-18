@@ -7,7 +7,15 @@ Bibliothèque standard seulement : « python3 -I probe.py ».
 
 Commandes :
   measure  sonde chaque service une fois (un échec est refait 20 s plus tard) et écrit UNE ligne de mesure
-  record   range cette ligne dans le fichier du jour, sur la branche probe-data du dépôt public de la page
+  plan     nombre de lots de ce passage : les créneaux utiles d'ici la fin de l'horizon, BATCH_SLOTS par lot
+  loop     un lot : mesure les créneaux de 5 minutes l'un après l'autre (au plus BATCH_SLOTS), sans jamais
+           remesurer un créneau déjà mesuré ; s'arrête sur une panne totale (un autre runner la confirme)
+  record   range les lignes dans le fichier du jour, sur la branche probe-data du dépôt public de la page ; un
+           créneau qui a déjà sa ligne n'en reçoit pas une deuxième
+
+Pourquoi des lots (16/11/2026) : le planificateur de GitHub n'a lancé que 5 des ~132 passages prévus ce jour-là ;
+un passage par créneau donnait des jours gris. Chaque passage lancé mesure donc plusieurs créneaux, par lots courts
+rangés l'un après l'autre (docs/SONDE.md, « Usage de GitHub Actions »).
 
 Les cibles (adresses, ports) ne sont JAMAIS dans le dépôt public, dans un journal ni dans une mesure : elles viennent
 d'un secret de l'hébergeur (PROBE_TARGETS, docs/SONDE.md). Une mesure ne contient que la clé du service, « up » ou
@@ -35,7 +43,9 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Callable, Iterable
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent
 PROBE_SCHEMA = "yanedo-status-probe/1"
@@ -60,6 +70,19 @@ CHECK_TYPES = {
 }
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
 SERVICE_KEY_LINE = re.compile(r"^\s*- key:\s*([a-z][a-z0-9-]*)\s*$", re.M)
+
+# Créneaux : les mêmes que le calcul (statusgen.py, Availability) : 5 minutes, alignés sur :00, :05… Zurich est décalé
+# d'heures entières, donc un créneau UTC est aussi un créneau de Zurich.
+SLOT = dt.timedelta(minutes=5)
+ZURICH = ZoneInfo("Europe/Zurich")
+CONTRACT_START, CONTRACT_END = dt.time(9, 0), dt.time(17, 0)  # du lundi au vendredi, à Zurich (contrat)
+UTC_WINDOW = (dt.time(6, 0), dt.time(17, 0))  # fenêtre de la chaîne (06:00-16:59 UTC) : la sonde n'en sort jamais
+BATCH_SLOTS = 4  # créneaux par lot : au plus 20 minutes de mesures perdues si un lot est interrompu
+# Horizon d'un passage, en créneaux : 96 = jusqu'à la fin des heures du contrat (17:00 à Zurich). Le premier passage
+# lancé du jour mesure donc jusqu'au soir ; les suivants ne servent que de relève (docs/SONDE.md).
+RUN_SLOTS = 96
+MEASURE_OFFSET = dt.timedelta(minutes=2)  # un créneau suivant se mesure à sa 2e minute, comme l'ancien cron (2, 7, 12…)
+MAX_WAIT = dt.timedelta(minutes=5)  # avant le premier créneau utile : attendre au plus le créneau suivant
 
 
 class TargetsError(Exception):
@@ -346,6 +369,158 @@ def measure(targets: dict, now: dt.datetime | None = None, witnesses=WITNESSES, 
     return line
 
 
+def is_all_down(line: dict) -> bool:
+    """Tout en panne d'un coup, témoin compris : le cas qu'un autre runner doit confirmer (liste de blocage)."""
+    return bool(line.get("results")) and all(v == "down" for v in line["results"].values())
+
+
+# --------------------------------------------------------------------------------------------- créneaux et lots
+
+def floor_slot(d: dt.datetime) -> dt.datetime:
+    """Début du créneau de 5 minutes (UTC) : la même règle que statusgen.floor_slot."""
+    d = d.astimezone(dt.timezone.utc)
+    return d.replace(minute=d.minute - d.minute % 5, second=0, microsecond=0)
+
+
+def in_utc_window(slot: dt.datetime) -> bool:
+    """Fenêtre de la chaîne : du lundi au vendredi, de 06:00 à 16:59 UTC. Rien n'est mesuré en dehors."""
+    u = slot.astimezone(dt.timezone.utc)
+    return u.weekday() < 5 and UTC_WINDOW[0] <= u.time() < UTC_WINDOW[1]
+
+
+def useful(slot: dt.datetime) -> bool:
+    """Créneau qui compte pour les barres : heures du contrat à Zurich (09:00-17:00, du lundi au vendredi), dans la
+    fenêtre de la chaîne. Les jours fériés ne sont pas connus ici (content/calendar.yaml demande PyYAML) : ils sont
+    mesurés, et le calcul les écarte."""
+    z = slot.astimezone(ZURICH)
+    return in_utc_window(slot) and z.weekday() < 5 and CONTRACT_START <= z.time() < CONTRACT_END
+
+
+def slot_of_line(line) -> dt.datetime | None:
+    """Créneau d'une ligne de mesure (son « at »), ou None si la ligne est abîmée."""
+    try:
+        at = dt.datetime.fromisoformat(str(line["at"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return floor_slot(at) if at.tzinfo else None
+
+
+def taken_slots(lines: Iterable) -> set[dt.datetime]:
+    """Créneaux qui ont déjà une ligne, avec ou sans témoin : jamais deux lignes pour un même créneau. Une ligne
+    abîmée n'occupe aucun créneau."""
+    out = set()
+    for line in lines:
+        if isinstance(line, str):
+            try:
+                line = json.loads(line)
+            except ValueError:
+                continue
+        slot = slot_of_line(line) if isinstance(line, dict) else None
+        if slot is not None:
+            out.add(slot)
+    return out
+
+
+def next_slot(now: dt.datetime, taken: set[dt.datetime], started: bool,
+              max_wait: dt.timedelta = MAX_WAIT) -> dt.datetime | None:
+    """Prochain créneau à mesurer : celui en cours s'il est libre, sinon le suivant libre. Avant la première mesure
+    du lot, on attend au plus max_wait un créneau utile ; ensuite, le premier créneau inutile (17:00 à Zurich, fin de
+    la fenêtre, week-end) termine le lot. None : rien à mesurer."""
+    slot, limit = floor_slot(now), now + max_wait
+    while True:
+        if slot in taken:
+            slot += SLOT
+        elif useful(slot):
+            return slot
+        elif started or slot > limit:
+            return None
+        else:
+            slot += SLOT
+
+
+def plan_batches(now: dt.datetime, horizon_slots: int = RUN_SLOTS, quota: int = BATCH_SLOTS,
+                 max_wait: dt.timedelta = MAX_WAIT) -> int:
+    """Lots de ce passage : les créneaux utiles consécutifs d'ici l'horizon, `quota` par lot. Zéro hors des heures
+    du contrat : le passage ne lance alors aucun runner de mesure."""
+    slot = next_slot(now, set(), started=False, max_wait=max_wait)
+    end, count = floor_slot(now) + horizon_slots * SLOT, 0
+    while slot is not None and slot < end and useful(slot):
+        count += 1
+        slot += SLOT
+    return -(-count // quota)
+
+
+class Clock:
+    """Horloge réelle. Les tests passent une horloge factice : aucun vrai sommeil, le temps avance à la demande."""
+
+    def now(self) -> dt.datetime:
+        return dt.datetime.now(dt.timezone.utc)
+
+    def sleep(self, seconds: float) -> None:
+        if seconds > 0:
+            time.sleep(seconds)
+
+
+def run_batch(measure_one: Callable[[dt.datetime], dict], clock, taken: set[dt.datetime], quota: int = BATCH_SLOTS,
+              confirm: bool = False, emit: Callable[[dict, str], None] | None = None,
+              max_wait: dt.timedelta = MAX_WAIT) -> tuple[list[dict], dict | None]:
+    """Un lot : au plus `quota` créneaux, l'un après l'autre, chacun mesuré une seule fois.
+
+    - Le créneau en cours se mesure tout de suite s'il est libre ; un créneau suivant, à sa 2e minute.
+    - Un créneau déjà mesuré (branche probe-data, lot précédent) n'est jamais remesuré.
+    - Aucune mesure ne commence après la fin prévue du lot : le job finit avant son délai, et le lot est rangé.
+    - Tout en panne d'un coup : le lot s'arrête, et la ligne attend la confirmation d'un autre runner (job confirm).
+      Le job confirm (confirm=True) mesure tout de suite : cette ligne remplace celle en attente et est toujours
+      rangée. Si elle confirme la panne, il finit le lot, et la panne qui dure reste rangée ; sinon, une nouvelle
+      panne totale vue de lui seul n'est pas rangée : le lot suivant, sur un autre runner, reprend.
+    Renvoie (lignes à ranger, ligne en attente de confirmation ou None). emit(ligne, note) est appelé après chaque
+    mesure, avant toute attente."""
+    deadline = clock.now() + quota * SLOT + SLOT
+    taken = set(taken)
+    lines: list[dict] = []
+    pending, outage = None, False
+    while len(lines) < quota:
+        now = clock.now()
+        if confirm and not lines:  # la confirmation : tout de suite, dans la fenêtre de la chaîne
+            slot = floor_slot(now)
+            while slot in taken:
+                slot += SLOT
+            if not in_utc_window(slot):
+                break
+            wake = max(now, slot)
+        else:
+            slot = next_slot(now, taken, started=bool(lines), max_wait=max_wait)
+            if slot is None:
+                break
+            wake = now if slot == floor_slot(now) else slot + MEASURE_OFFSET
+        if wake >= deadline:
+            break
+        clock.sleep((wake - clock.now()).total_seconds())
+        at = clock.now()
+        if floor_slot(at) != slot:  # réveil tardif : le créneau prévu est passé, on recalcule
+            continue
+        line = measure_one(at)
+        taken.add(slot_of_line(line) or slot)
+        down = is_all_down(line)
+        if confirm and not lines:
+            lines.append(line)
+            outage = down
+            note = "confirmation : panne totale confirmée" if down else "confirmation : pas de panne totale"
+        elif down and not outage:
+            pending = line
+            note = ("nouvelle panne totale, vue de ce seul runner : non rangée, le lot suivant (autre runner) reprend"
+                    if confirm else "panne totale : confirmation demandée à un autre runner")
+        else:
+            lines.append(line)
+            outage = outage and down
+            note = "rangée avec le lot"
+        if emit:
+            emit(line, note)
+        if pending is not None:
+            break
+    return lines, pending
+
+
 # --------------------------------------------------------------------------------------------- rangement (git)
 
 def _git(cwd: Path, *args: str, env: dict | None = None, check: bool = True) -> subprocess.CompletedProcess:
@@ -367,24 +542,43 @@ def _auth_env(token: str | None) -> dict:
 
 BRANCH_README = """# Mesures de la sonde extérieure
 
-Branche écrite par la chaîne `probe` : une ligne JSON par passage de la sonde (toutes les 5 minutes, du lundi au
-vendredi, pendant les heures du contrat et autour), dans `probe/AAAA-MM-JJ.jsonl` (date UTC). Format
+Branche écrite par la chaîne `probe` : au plus une ligne JSON par créneau de 5 minutes, du lundi au vendredi, pendant
+les heures du contrat, dans `probe/AAAA-MM-JJ.jsonl` (date UTC). Format
 `yanedo-status-probe/1` : `at` (UTC), `witness` (le réseau de la sonde fonctionnait), `results` (clé du service →
 `up` ou `down`), `reasons` (raison générique d'un `down`). La chaîne `pages` les lit pour les barres de
 disponibilité. Ne pas modifier à la main.
 """
 
 
-def record(line: dict, remote: str, branch: str, token: str | None, author: str = "Yanedo status probe",
-           email: str = "status@noreply.invalid", attempts: int = 4) -> str:
-    """Ajoute la ligne au fichier du jour, sur sa branche ; refait tout si une autre passe a poussé entre-temps."""
-    if line.get("schema") != PROBE_SCHEMA or not re.match(r"^\d{4}-\d{2}-\d{2}T", str(line.get("at", ""))):
-        raise TargetsError(["ligne de mesure invalide"])
-    text = json.dumps(line, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def dump_line(line: dict) -> str:
+    return json.dumps(line, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def record(lines: dict | list[dict], remote: str, branch: str, token: str | None,
+           author: str = "Yanedo status probe", email: str = "status@noreply.invalid", attempts: int = 4) -> str:
+    """Ajoute les lignes (une, ou un lot) au fichier de leur jour, sur leur branche, en un seul commit par jour.
+
+    - Jamais deux lignes pour un même créneau : une ligne dont le créneau a déjà sa ligne sur la branche (ou plus tôt
+      dans le lot) est écartée. C'est la garde finale, quoi qu'aient fait la mesure et les autres passages.
+    - Si une autre passe a poussé entre-temps, tout est refait depuis la branche à jour, garde comprise."""
+    lines = [lines] if isinstance(lines, dict) else list(lines)
+    for line in lines:
+        if (not isinstance(line, dict) or line.get("schema") != PROBE_SCHEMA or slot_of_line(line) is None
+                or not re.match(r"^\d{4}-\d{2}-\d{2}T", str(line.get("at", "")))):
+            raise TargetsError(["ligne de mesure invalide"])
+    days: dict[str, list[dict]] = {}
+    for line in lines:
+        days.setdefault(line["at"][:10], []).append(line)
+    return " ; ".join(_record_day(day, batch, remote, branch, token, author, email, attempts)
+                      for day, batch in sorted(days.items()))
+
+
+def _record_day(day: str, lines: list[dict], remote: str, branch: str, token: str | None, author: str, email: str,
+                attempts: int) -> str:
     env = _auth_env(token)
     commit_env = dict(env, GIT_AUTHOR_NAME=author, GIT_AUTHOR_EMAIL=email, GIT_COMMITTER_NAME=author,
                       GIT_COMMITTER_EMAIL=email)
-    name = f"probe/{line['at'][:10]}.jsonl"
+    name = f"probe/{day}.jsonl"
     for attempt in range(attempts):
         with tempfile.TemporaryDirectory(prefix="status-probe-") as tmp:
             clone = Path(tmp)
@@ -401,14 +595,26 @@ def record(line: dict, remote: str, branch: str, token: str | None, author: str 
             path = clone / name
             path.parent.mkdir(exist_ok=True)
             current = path.read_text(encoding="utf-8") if path.exists() else ""
-            if text in current.splitlines():
-                return f"déjà rangée : {name}"
-            path.write_text(current + text + "\n", encoding="utf-8")
+            if current and not current.endswith("\n"):
+                current += "\n"
+            taken = taken_slots(current.splitlines())
+            added: list[dict] = []
+            for line in lines:
+                slot = slot_of_line(line)
+                if slot not in taken:
+                    taken.add(slot)
+                    added.append(line)
+            skipped = len(lines) - len(added)
+            if not added:
+                return f"déjà rangée : {name} ({skipped} créneau(x) déjà mesuré(s))"
+            path.write_text(current + "".join(dump_line(l) + "\n" for l in added), encoding="utf-8")
             _git(clone, "add", "-A", env=env)
-            _git(clone, "-c", "commit.gpgsign=false", "commit", "-q", "-m", f"probe {line['at']}", env=commit_env)
+            message = f"probe {added[0]['at']}" + (f" (+{len(added) - 1})" if len(added) > 1 else "")
+            _git(clone, "-c", "commit.gpgsign=false", "commit", "-q", "-m", message, env=commit_env)
             pushed = _git(clone, "push", "-q", "origin", f"HEAD:refs/heads/{branch}", env=env, check=False)
             if pushed.returncode == 0:
-                return f"rangée : {name}"
+                done = f"rangée : {name}" if len(added) == 1 else f"rangées : {len(added)} lignes dans {name}"
+                return done + (f" ({skipped} créneau(x) déjà mesuré(s), écarté(s))" if skipped else "")
         time.sleep(2 + 3 * attempt + random.random())
     raise HostError(f"poussée refusée {attempts} fois de suite sur {branch}")
 
@@ -423,56 +629,122 @@ def _github_output(values: dict[str, str]) -> None:
                 fh.write(f"{key}={value}\n")
 
 
-def main(argv: list[str] | None = None) -> int:
+def load_targets(env_name: str | None, file_name: str | None) -> dict:
+    """Les cibles, validées ; dans GitHub Actions, chaque adresse est masquée dans le journal public avant tout."""
+    raw = os.environ.get(env_name, "") if env_name else Path(file_name).read_text("utf-8")
+    if not raw.strip():
+        raise TargetsError([f"cibles absentes : {env_name or file_name} est vide (secret PROBE_TARGETS non posé ?)"])
+    try:
+        targets = json.loads(raw)
+    except ValueError:
+        raise TargetsError(["cibles illisibles : JSON invalide"]) from None
+    errors = validate_targets(targets, public_keys())
+    if errors:
+        raise TargetsError(errors)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        for value in secrets_to_mask(targets):
+            print(f"::add-mask::{value}")
+    return targets
+
+
+def print_line(line: dict, prefix: str = "") -> None:
+    """Journal public : l'heure, puis la clé de chaque service et son état ; jamais une adresse."""
+    if prefix:
+        print(prefix)
+    if not line["witness"]:
+        print("témoin muet : le réseau de la sonde ne répond pas ; mesure sans valeur")
+    for key, value in line["results"].items():
+        print(f"{key} : {value}" + (f" ({line['reasons'][key]})" if key in line["reasons"] else ""))
+
+
+def lines_from_env(name: str) -> list[dict]:
+    """Lignes de mesure d'une variable : un tableau JSON, une ligne JSON, ou des lignes JSON l'une sous l'autre."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return []
+    try:
+        values = json.loads(raw) if raw.startswith("[") else [json.loads(l) for l in raw.splitlines() if l.strip()]
+    except ValueError:
+        raise TargetsError([f"lignes de mesure illisibles dans {name}"]) from None
+    if not all(isinstance(v, dict) for v in values):
+        raise TargetsError([f"lignes de mesure illisibles dans {name}"])
+    return values
+
+
+def _dump_lines(lines: list[dict]) -> str:
+    return "[" + ",".join(dump_line(l) for l in lines) + "]"
+
+
+def main(argv: list[str] | None = None, clock=None) -> int:
     parser = argparse.ArgumentParser(description="Sonde extérieure de la page d'état de Yanedo")
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_measure = sub.add_parser("measure", help="sonder les services et écrire une ligne de mesure")
-    src = p_measure.add_mutually_exclusive_group(required=True)
-    src.add_argument("--targets-env", help="variable d'environnement qui contient les cibles (secret de l'hébergeur)")
-    src.add_argument("--targets-file", help="fichier des cibles (essai à blanc sur un poste)")
-    p_measure.add_argument("--out", help="fichier où écrire la ligne")
-    p_record = sub.add_parser("record", help="ranger une ligne de mesure sur la branche des mesures")
-    p_record.add_argument("--line-env", required=True, help="variable d'environnement qui contient la ligne")
+    p_loop = sub.add_parser("loop", help="un lot : mesurer les créneaux l'un après l'autre (au plus BATCH_SLOTS)")
+    for p in (p_measure, p_loop):
+        src = p.add_mutually_exclusive_group(required=True)
+        src.add_argument("--targets-env", help="variable d'environnement qui contient les cibles (secret de l'hébergeur)")
+        src.add_argument("--targets-file", help="fichier des cibles (essai à blanc sur un poste)")
+        p.add_argument("--out", help="fichier où écrire la ligne (loop : ajoutée après chaque mesure)")
+    p_loop.add_argument("--known-dir", help="dossier probe/ de la branche probe-data : créneaux déjà mesurés")
+    p_loop.add_argument("--known-env", help="variable qui contient les lignes du job measure (job confirm)")
+    p_loop.add_argument("--confirm", action="store_true", help="job confirm : mesurer tout de suite, puis finir le lot")
+    p_plan = sub.add_parser("plan", help="nombre de lots de ce passage (sortie batches=[1,…])")
+    p_plan.add_argument("--now", help="heure de référence RFC 3339 (essais)")
+    p_record = sub.add_parser("record", help="ranger des lignes de mesure sur la branche des mesures")
+    p_record.add_argument("--lines-env", action="append", required=True,
+                          help="variable qui contient des lignes de mesure (répétable ; vide : rien)")
     p_record.add_argument("--remote", required=True)
     p_record.add_argument("--branch", default="probe-data")
     p_record.add_argument("--token-env")
     args = parser.parse_args(argv)
+    clock = clock or Clock()
     try:
         if args.cmd == "measure":
-            raw = os.environ.get(args.targets_env, "") if args.targets_env else Path(args.targets_file).read_text("utf-8")
-            if not raw.strip():
-                raise TargetsError([f"cibles absentes : {args.targets_env or args.targets_file} est vide "
-                                    "(secret PROBE_TARGETS non posé ?)"])
-            try:
-                targets = json.loads(raw)
-            except ValueError:
-                raise TargetsError(["cibles illisibles : JSON invalide"]) from None
-            errors = validate_targets(targets, public_keys())
-            if errors:
-                raise TargetsError(errors)
-            if os.environ.get("GITHUB_ACTIONS") == "true":
-                for value in secrets_to_mask(targets):
-                    print(f"::add-mask::{value}")
+            targets = load_targets(args.targets_env, args.targets_file)
             line = measure(targets, witnesses=WITNESSES, retry_delay=RETRY_DELAY)
-            text = json.dumps(line, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            text = dump_line(line)
             if args.out:
                 Path(args.out).write_text(text + "\n", encoding="utf-8")
-            if not line["witness"]:
-                print("témoin muet : le réseau de la sonde ne répond pas ; mesure sans valeur")
-            for key, value in line["results"].items():
-                print(f"{key} : {value}" + (f" ({line['reasons'][key]})" if key in line["reasons"] else ""))
-            all_down = bool(line["results"]) and all(v == "down" for v in line["results"].values())
-            _github_output({"line": text, "all_down": "true" if all_down else "false"})
+            print_line(line)
+            _github_output({"line": text, "all_down": "true" if is_all_down(line) else "false"})
+        elif args.cmd == "loop":
+            targets = load_targets(args.targets_env, args.targets_file)
+            taken: set[dt.datetime] = set()
+            if args.known_dir:
+                day_file = Path(args.known_dir) / f"{clock.now():%Y-%m-%d}.jsonl"
+                if day_file.is_file():
+                    taken |= taken_slots(day_file.read_text(encoding="utf-8", errors="replace").splitlines())
+            before = lines_from_env(args.known_env) if args.known_env else []
+            taken |= taken_slots(before)
+            quota = BATCH_SLOTS - (len(before) if args.confirm else 0)
+            out = Path(args.out) if args.out else None
+
+            def measure_one(at: dt.datetime) -> dict:
+                return measure(targets, now=at, witnesses=WITNESSES, retry_delay=RETRY_DELAY)
+
+            def emit(line: dict, note: str) -> None:
+                print_line(line, f"créneau {floor_slot(slot_of_line(line)):%H:%M} UTC, mesure {line['at']} : {note}")
+                if out:  # au fil de l'eau : chaque mesure est écrite dès qu'elle est faite
+                    with out.open("a", encoding="utf-8") as fh:
+                        fh.write(dump_line(line) + "\n")
+
+            lines, pending = run_batch(measure_one, clock, taken, quota=quota, confirm=args.confirm, emit=emit)
+            waiting = [pending] if pending is not None and not args.confirm else []
+            print(f"lot : {len(lines)} créneau(x) à ranger" + (", un en attente de confirmation" if waiting else ""))
+            _github_output({"lines": _dump_lines(lines), "pending": _dump_lines(waiting),
+                            "all_down": "true" if waiting else "false"})
+        elif args.cmd == "plan":
+            now = (dt.datetime.fromisoformat(args.now.replace("Z", "+00:00")) if args.now else clock.now())
+            batches = list(range(1, plan_batches(now) + 1))
+            print(f"{len(batches)} lot(s) de {BATCH_SLOTS} créneaux au plus" if batches
+                  else "hors des heures du contrat : rien à mesurer")
+            _github_output({"batches": json.dumps(batches, separators=(",", ":"))})
         else:
-            raw = os.environ.get(args.line_env, "")
-            try:
-                line = json.loads(raw)
-            except ValueError:
-                raise TargetsError(["ligne de mesure absente ou illisible"]) from None
+            lines = [l for name in args.lines_env for l in lines_from_env(name)]
             token = os.environ.get(args.token_env, "") if args.token_env else None
             if args.token_env and not token:
                 raise HostError(f"jeton absent : variable {args.token_env} vide")
-            print(record(line, args.remote, args.branch, token))
+            print(record(lines, args.remote, args.branch, token) if lines else "rien à ranger")
     except TargetsError as exc:
         for problem in exc.args[0]:
             print(f"REFUS : {problem}", file=sys.stderr)

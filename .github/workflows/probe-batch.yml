@@ -1,0 +1,117 @@
+# Un lot de la sonde extérieure : appelé par probe.yml, un lot après l'autre (matrice, max-parallel: 1). Posé par
+# « statusgen.py publish-git » dans .github/workflows/ du dépôt public.
+#
+# - measure : mesure au plus 4 créneaux de 5 minutes, l'un après l'autre, sans remesurer un créneau déjà rangé
+#   (branche probe-data, lue sans droit). Lent n'est pas en panne (contrat) : seul un silence de 30 s par opération
+#   réseau compte comme « down ». D'où 31 minutes : au plus 25 minutes avant de commencer la dernière mesure,
+#   plus les 6 minutes d'une mesure au pire (deux passes).
+# - confirm : tout en panne d'un coup, le lot s'arrête et un deuxième runner (une autre adresse) refait la mesure,
+#   qui remplace la première ; s'il confirme la panne, il finit le lot. Une liste de blocage qui viserait l'adresse
+#   d'un runner ne passe donc pas pour une panne de Yanedo. Si confirm échoue, la mesure de measure est rangée,
+#   comme avant le correctif.
+# - record : range le lot sur la branche probe-data, dès la fin du lot ; jamais deux lignes pour un même créneau ;
+#   refait tout si une autre poussée est passée entre-temps.
+# - Droits séparés : measure et confirm ont les cibles et aucun droit ; record a « contents: write » et pas les
+#   cibles. Aucune action de GitHub ni d'un tiers : git et Python seulement.
+name: probe-batch
+
+on:
+  workflow_call:
+    secrets:
+      PROBE_TARGETS:
+        required: true
+
+permissions: {}
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 31
+    outputs:
+      lines: ${{ steps.measure.outputs.lines }}
+      pending: ${{ steps.measure.outputs.pending }}
+      all_down: ${{ steps.measure.outputs.all_down }}
+    steps:
+      - name: Source
+        run: |
+          git init -q src
+          cd src
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
+      - name: Mesures déjà rangées (branche probe-data, lecture seule)
+        run: |
+          git init -q probe-data
+          cd probe-data
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads origin probe-data > /dev/null; then
+            git fetch -q --depth 1 origin probe-data
+            git checkout -q FETCH_HEAD
+          fi
+      - name: Mesurer, créneau par créneau
+        id: measure
+        working-directory: src
+        env:
+          PROBE_TARGETS: ${{ secrets.PROBE_TARGETS }}
+        run: python3 -I probe.py loop --targets-env PROBE_TARGETS --known-dir ../probe-data/probe
+
+  confirm:
+    needs: measure
+    if: needs.measure.outputs.all_down == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 31
+    outputs:
+      lines: ${{ steps.measure.outputs.lines }}
+    steps:
+      - name: Source
+        run: |
+          git init -q src
+          cd src
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
+      - name: Mesures déjà rangées (branche probe-data, lecture seule)
+        run: |
+          git init -q probe-data
+          cd probe-data
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads origin probe-data > /dev/null; then
+            git fetch -q --depth 1 origin probe-data
+            git checkout -q FETCH_HEAD
+          fi
+      - name: Mesurer depuis un autre runner, puis finir le lot
+        id: measure
+        working-directory: src
+        env:
+          PROBE_TARGETS: ${{ secrets.PROBE_TARGETS }}
+          PROBE_BEFORE: ${{ needs.measure.outputs.lines }}
+        run: >-
+          python3 -I probe.py loop --confirm --targets-env PROBE_TARGETS --known-dir ../probe-data/probe
+          --known-env PROBE_BEFORE
+
+  record:
+    needs: [measure, confirm]
+    if: >-
+      always() && needs.measure.result == 'success'
+      && (needs.measure.outputs.lines != '[]' || needs.measure.outputs.all_down == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    steps:
+      - name: Source
+        run: |
+          git init -q src
+          cd src
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
+      - name: Ranger le lot (branche probe-data)
+        working-directory: src
+        env:
+          PROBE_MEASURED: ${{ needs.measure.outputs.lines }}
+          PROBE_CONFIRMED: ${{ needs.confirm.outputs.lines || needs.measure.outputs.pending }}
+          PROBE_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -I probe.py record --lines-env PROBE_MEASURED --lines-env PROBE_CONFIRMED --token-env PROBE_TOKEN
+          --branch probe-data --remote "https://github.com/${GITHUB_REPOSITORY}.git"

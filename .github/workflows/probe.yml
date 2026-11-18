@@ -1,19 +1,20 @@
 # Sonde extérieure des barres de disponibilité (note T32 v2.0, § 7). Posée par « statusgen.py publish-git » dans
-# .github/workflows/ du dépôt public, à côté de pages.yml. Elle tourne chez GitHub : hors du cluster et hors du
-# réseau de Yanedo, elle mesure aussi quand le cluster est en panne.
+# .github/workflows/ du dépôt public, à côté de pages.yml et de probe-batch.yml. Elle tourne chez GitHub : hors du
+# cluster et hors du réseau de Yanedo, elle mesure aussi quand le cluster est en panne.
 #
-# - Toutes les 5 minutes, du lundi au vendredi, de 06:00 à 16:59 UTC : les heures du contrat (09:00-17:00 à
-#   Zurich) en heure d'hiver comme d'été. Jamais à la minute 0 (heure de pointe du planificateur de GitHub, où les
-#   passages sont le plus souvent retardés ou perdus). Un passage perdu n'est pas une panne : le créneau est
-#   simplement « non mesuré » (docs/SONDE.md).
+# - Pourquoi des passages longs (correctif du 16/11/2026) : GitHub ne lance qu'une petite partie des départs planifiés
+#   (5 sur ~132 le 16/11 ; Upptime lui-même, cron « */5 », en reçoit 2 à 7 par jour). Chaque passage lancé mesure donc
+#   tous les créneaux de 5 minutes jusqu'à la fin des heures du contrat, par lots de 4 créneaux (20 minutes), rangés
+#   l'un après l'autre : un passage interrompu ne perd que son lot en cours. Les départs suivants ne servent que de
+#   relève (concurrence ci-dessous). Usage de GitHub Actions : docs/SONDE.md.
+# - Départs : du lundi au vendredi, de 06:00 à 16:59 UTC, jamais à la minute 0 : les heures du contrat (09:00-17:00 à
+#   Zurich) en heure d'hiver comme d'été. Le job plan ne lance aucun lot hors des heures du contrat.
+# - Un passage à la fois : un départ créé pendant un passage attend ; s'il en attendait déjà un, GitHub annule
+#   l'ancien. Un créneau déjà mesuré ne l'est jamais une deuxième fois (probe.py, loop et record).
 # - Les cibles viennent du secret PROBE_TARGETS, jamais du dépôt ; probe.py les masque dans les journaux publics
 #   et n'écrit dans une mesure que la clé du service, up/down et une raison générique.
-# - Droits séparés : les jobs qui ont les cibles n'ont aucun droit ; le job qui écrit sur la branche probe-data
-#   n'a pas les cibles. Aucune action de GitHub ni d'un tiers : git et Python seulement.
-# - Lent n'est pas en panne (contrat) : seul un silence de 30 s par opération réseau compte comme « down » ;
-#   d'où 6 minutes pour measure et confirm (deux passes au pire).
-# - Tout en panne d'un coup : un deuxième runner (une autre adresse) refait la mesure avant de la ranger. Une
-#   liste de blocage qui viserait l'adresse d'un runner ne passe donc pas pour une panne de Yanedo.
+# - Droits séparés (probe-batch.yml) : les jobs qui ont les cibles n'ont aucun droit ; le job qui écrit sur la branche
+#   probe-data n'a pas les cibles. Aucune action de GitHub ni d'un tiers : git et Python seulement.
 name: probe
 
 on:
@@ -28,56 +29,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  measure:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 6
-    outputs:
-      line: ${{ steps.measure.outputs.line }}
-      all_down: ${{ steps.measure.outputs.all_down }}
-    steps:
-      - name: Source
-        run: |
-          git init -q src
-          cd src
-          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch -q --depth 1 origin "${GITHUB_SHA}"
-          git checkout -q FETCH_HEAD
-      - name: Mesurer
-        id: measure
-        working-directory: src
-        env:
-          PROBE_TARGETS: ${{ secrets.PROBE_TARGETS }}
-        run: python3 -I probe.py measure --targets-env PROBE_TARGETS
-
-  confirm:
-    needs: measure
-    if: needs.measure.outputs.all_down == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 6
-    outputs:
-      line: ${{ steps.measure.outputs.line }}
-    steps:
-      - name: Source
-        run: |
-          git init -q src
-          cd src
-          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch -q --depth 1 origin "${GITHUB_SHA}"
-          git checkout -q FETCH_HEAD
-      - name: Mesurer depuis un autre runner
-        id: measure
-        working-directory: src
-        env:
-          PROBE_TARGETS: ${{ secrets.PROBE_TARGETS }}
-        run: python3 -I probe.py measure --targets-env PROBE_TARGETS
-
-  record:
-    needs: [measure, confirm]
-    if: always() && needs.measure.result == 'success'
+  plan:
     runs-on: ubuntu-24.04
     timeout-minutes: 3
-    permissions:
-      contents: write
+    outputs:
+      batches: ${{ steps.plan.outputs.batches }}
     steps:
       - name: Source
         run: |
@@ -86,11 +42,21 @@ jobs:
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
           git fetch -q --depth 1 origin "${GITHUB_SHA}"
           git checkout -q FETCH_HEAD
-      - name: Ranger la mesure (branche probe-data)
+      - name: Lots de ce passage
+        id: plan
         working-directory: src
-        env:
-          PROBE_LINE: ${{ needs.confirm.outputs.line || needs.measure.outputs.line }}
-          PROBE_TOKEN: ${{ github.token }}
-        run: >-
-          python3 -I probe.py record --line-env PROBE_LINE --token-env PROBE_TOKEN --branch probe-data
-          --remote "https://github.com/${GITHUB_REPOSITORY}.git"
+        run: python3 -I probe.py plan
+
+  batch:
+    needs: plan
+    if: needs.plan.outputs.batches != '[]'
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        batch: ${{ fromJSON(needs.plan.outputs.batches) }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/probe-batch.yml
+    secrets:
+      PROBE_TARGETS: ${{ secrets.PROBE_TARGETS }}
