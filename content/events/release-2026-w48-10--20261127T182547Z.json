@@ -1,0 +1,9 @@
+{
+ "at": "2026-11-27T18:25:47Z",
+ "id": "release-2026-w48-10",
+ "kind": "release",
+ "schema": "yanedo-status-event/1",
+ "start": "2026-11-27T18:19:16Z",
+ "status": "completed",
+ "version": "2026-W48.10"
+}
